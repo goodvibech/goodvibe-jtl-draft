@@ -1,84 +1,77 @@
 <?php
 /**
- * Plugin Name: goodvibe JTL Keep Products as Draft (no delete)
- * Description: When JTL Connector calls /jtlconnector/?jtlauth=..., prevent product deletions/trash and set status to 'draft' instead.
- * Author: goodvibe GmbH
+ * Plugin Name: JTL Keep Products As Draft (Block Delete/Trash)
+ * Description: If JTL Connector tries to delete/trash a product, keep it as draft instead.
+ * Author: Your Team
+ * Version: 1.1.0
  */
 
-/**
- * Detect if current request is coming from the JTL Connector endpoint.
- * We match the known entrypoint and auth pattern: /jtlconnector/?jtlauth=...
- * Optionally restrict by source IPs you trust for the connector.
- */
+// Quick, cheap check to detect a JTL Connector call by URL.
 function jtl_is_connector_request(): bool {
-    // 1) URL fingerprint
-    $uri  = $_SERVER['REQUEST_URI']  ?? '';
-    $qstr = $_SERVER['QUERY_STRING'] ?? '';
-    $has_endpoint = (stripos($uri, '/jtlconnector/') !== false);
-    $has_token    = (isset($_GET['jtlauth']) || stripos($qstr, 'jtlauth=') !== false);
-
-    if (!($has_endpoint && $has_token)) {
-        return false;
-    }
-
-    // 2) Optional - lock to known connector IPs (add more if needed)
-    $allowed_ips = [
-        '212.133.108.36',
-        // 'x.x.x.x',
-    ];
-    $remote_ip = $_SERVER['REMOTE_ADDR'] ?? '';
-    if (!empty($allowed_ips) && $remote_ip && !in_array($remote_ip, $allowed_ips, true)) {
-        return false;
-    }
-
-    return true;
+    // Matches /index.php/jtlconnector/?jtlauth=...
+    $uri = $_SERVER['REQUEST_URI'] ?? '';
+    return (stripos($uri, '/jtlconnector/') !== false) && isset($_GET['jtlauth']);
 }
-
-/** Flip to draft and stop deletion/trash. */
-function jtl_convert_delete_to_draft($post): void {
-    if (!$post || !in_array($post->post_type, ['product','product_variation'], true)) {
-        return;
-    }
-    if (get_post_status($post->ID) !== 'draft') {
-        // Remove hooks here if you have 3rd-party listeners that react to status changes to avoid loops.
-        wp_update_post(['ID' => $post->ID, 'post_status' => 'draft']);
-    }
-    if (defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
-        error_log('JTL keep-draft: prevented delete/trash for post ID '.$post->ID.' (URI='.$_SERVER['REQUEST_URI'].')');
-    }
-}
-
-/** Hard delete interceptor */
-add_filter('pre_delete_post', function ($delete, $post, $force) {
-    if (!jtl_is_connector_request()) return $delete;
-    if ($post && in_array($post->post_type, ['product','product_variation'], true)) {
-        jtl_convert_delete_to_draft($post);
-        return false; // cancel deletion
-    }
-    return $delete;
-}, 10, 3);
-
-/** Move-to-trash interceptor */
-add_filter('pre_trash_post', function ($trash, $post) {
-    if (!jtl_is_connector_request()) return $trash;
-    if ($post && in_array($post->post_type, ['product','product_variation'], true)) {
-        jtl_convert_delete_to_draft($post);
-        return false; // cancel trash
-    }
-    return $trash;
-}, 10, 2);
 
 /**
- * Extra safety belt:
- * If a plugin bypasses filters and reaches 'before_delete_post', kill the flow gracefully.
- * This is conservative and only triggers on JTL connector requests.
+ * Core handler: when JTL attempts to trash/delete a product, set status to draft and abort the delete.
+ * Runs for both pre-trash and pre-delete flows.
  */
-add_action('before_delete_post', function ($post_id) {
-    if (!jtl_is_connector_request()) return;
-    $post = get_post($post_id);
-    if ($post && in_array($post->post_type, ['product','product_variation'], true)) {
-        jtl_convert_delete_to_draft($post);
-        // Stop execution quietly with a 200 so the connector doesn't treat it as a fatal error.
-        wp_die('', '', ['response' => 200]);
+function jtl_keep_product_as_draft($delete, $post, $force_delete = false) {
+    // Only act on JTL calls
+    if ( ! jtl_is_connector_request() ) {
+        return $delete; // do nothing for normal usage
     }
-}, 0);
+
+    // Normalize $post to WP_Post
+    $post = get_post($post);
+    if ( ! $post ) {
+        return $delete;
+    }
+
+    // Only for Woo products (incl. variations)
+    $allowed_types = array('product', 'product_variation');
+    if ( ! in_array($post->post_type, $allowed_types, true) ) {
+        return $delete;
+    }
+
+    // If already draft, just block the delete/trash
+    if ($post->post_status !== 'draft') {
+        // Update post_status to draft without touching modified dates more than needed
+        wp_update_post(array(
+            'ID'          => $post->ID,
+            'post_status' => 'draft',
+        ));
+    }
+
+    // Optional: remove from catalog/search visibility as extra safety
+    if (function_exists('wc_get_product')) {
+        $wc_product = wc_get_product($post->ID);
+        if ($wc_product) {
+            $wc_product->set_catalog_visibility('hidden');
+            $wc_product->save();
+        }
+    }
+
+    // Log for auditing
+    if (defined('WP_DEBUG') && WP_DEBUG) {
+        $ip  = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $uri = $_SERVER['REQUEST_URI'] ?? '';
+        error_log(sprintf(
+            'JTL keep-draft: prevented delete/trash for post ID %d from IP %s (URI=%s)',
+            $post->ID,
+            $ip,
+            $uri
+        ));
+    }
+
+    // Return true here would allow delete, so we must block:
+    // For pre_trash_post: returning a non-null value short-circuits. Return true would force TRASH.
+    // For pre_delete_post: returning a non-null value short-circuits. Return true would force DELETE.
+    // Therefore we return **false** to block both.
+    return false;
+}
+
+// Hook both "pre" filters with high priority so we run after most plugins.
+add_filter('pre_trash_post',  'jtl_keep_product_as_draft', 999, 2);
+add_filter('pre_delete_post', 'jtl_keep_product_as_draft', 999, 3);
